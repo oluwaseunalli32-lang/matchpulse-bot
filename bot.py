@@ -1,7 +1,11 @@
 import os
+import time
+import signal
 import logging
+import sys
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -12,6 +16,10 @@ from telegram.ext import (
 # --- Configuration ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 FOOTBALL_API_KEY = os.environ.get("FOOTBALL_API_KEY")
+
+# --- Retry settings for Conflict errors ---
+MAX_RETRIES = 5
+RETRY_DELAY_SECONDS = 15
 
 # --- Logging ---
 logging.basicConfig(
@@ -112,6 +120,28 @@ async def team_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, parse_mode="Markdown")
 
 
+# --- Application builder ---
+def build_application() -> Application:
+    """Create a fresh Application with all handlers registered."""
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(
+        CallbackQueryHandler(team_selected, pattern=r"^team_")
+    )
+    return application
+
+
+# --- Graceful shutdown ---
+_shutdown_requested = False
+
+
+def _handle_sigterm(signum, frame):
+    """Mark that we should stop after the current polling session."""
+    global _shutdown_requested
+    _shutdown_requested = True
+    logger.info("SIGTERM received — will stop after current polling cycle.")
+
+
 # --- Entry point ---
 def main():
     if not BOT_TOKEN:
@@ -119,18 +149,52 @@ def main():
     if not FOOTBALL_API_KEY:
         raise RuntimeError("FOOTBALL_API_KEY environment variable is not set.")
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Install SIGTERM handler so Render's shutdown signal is respected.
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    signal.signal(signal.SIGINT, _handle_sigterm)
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(
-        CallbackQueryHandler(team_selected, pattern=r"^team_")
-    )
+    attempt = 0
+    while attempt < MAX_RETRIES and not _shutdown_requested:
+        attempt += 1
+        logger.info(f"Starting polling (attempt {attempt}/{MAX_RETRIES})...")
 
-    logger.info("MatchPulse Bot is starting (polling mode)...")
-    application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
-    )
+        # Build a fresh Application each attempt — reusing one after a
+        # Conflict can leave internal state in a bad way.
+        application = build_application()
+
+        try:
+            # Force-clear any stale webhook/polling session on Telegram's side.
+            # This is harmless if nothing is set and helps resolve stuck conflicts.
+            try:
+                application.bot.delete_webhook(drop_pending_updates=True)
+            except Exception as e:
+                logger.warning(f"Could not clear webhook on startup: {e}")
+
+            application.run_polling(
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES,
+            )
+            # run_polling() returns normally when stopped (e.g. via SIGTERM).
+            logger.info("Polling stopped cleanly.")
+            break
+
+        except Conflict as e:
+            logger.warning(
+                f"Conflict detected (attempt {attempt}/{MAX_RETRIES}): {e}"
+            )
+            if attempt >= MAX_RETRIES:
+                logger.error("Max retries reached. Exiting.")
+                sys.exit(1)
+            logger.info(
+                f"Waiting {RETRY_DELAY_SECONDS}s for the old instance to shut down..."
+            )
+            time.sleep(RETRY_DELAY_SECONDS)
+
+        except Exception as e:
+            logger.exception(f"Unexpected error during polling: {e}")
+            sys.exit(1)
+
+    logger.info("MatchPulse Bot has shut down.")
 
 
 if __name__ == "__main__":
