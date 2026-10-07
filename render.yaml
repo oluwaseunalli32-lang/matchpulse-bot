@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: matchpulse-bot
+    runtime: python
+    plan: starter          # Worker services require a paid plan (no free tier)
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: FOOTBALL_API_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.0
